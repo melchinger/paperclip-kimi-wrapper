@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "paperclip-kimi-wrapper"
+version = "0.1.0"
+description = "Portable Kimi CLI wrapper for self-hosted Paperclip agents"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+  { name = "Melchinger" }
+]
+license = { text = "MIT" }
+dependencies = []
+
+[project.scripts]
+kimi-paperclip-wrapper = "kimi_paperclip_wrapper.wrapper:entrypoint"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

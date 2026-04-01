@@ -1,0 +1,13 @@
+{
+  "adapterType": "codex_local",
+  "adapterConfig": {
+    "cwd": "/srv/paperclip/workspaces/acme",
+    "model": "kimi-code/kimi-for-coding",
+    "search": false,
+    "command": "/srv/paperclip/tools/paperclip-kimi-wrapper/bin/kimi-paperclip-wrapper",
+    "graceSec": 15,
+    "timeoutSec": 0,
+    "instructionsFilePath": "/srv/paperclip/workspaces/acme/agents/architect/AGENTS.md",
+    "dangerouslyBypassApprovalsAndSandbox": true
+  }
+}
