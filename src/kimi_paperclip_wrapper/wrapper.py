@@ -436,7 +436,23 @@ def parse_codex_args(argv: list[str]) -> dict:
     }
 
 
-def stream_process(args: list[str], prompt: str) -> tuple[int, str, str]:
+def _extract_stream_texts(event: dict) -> list[str]:
+    if not isinstance(event, dict):
+        return []
+    event_type = _event_type(event)
+    if event_type not in {"message.delta", "response.output_text.delta"}:
+        return []
+    texts: list[str] = []
+    for part in _content_parts(event):
+        if part.get("type") != "text":
+            continue
+        text = str(part.get("text") or "")
+        if text:
+            texts.append(text)
+    return texts
+
+
+def stream_process(args: list[str], prompt: str, on_text=None) -> tuple[int, str, str]:
     proc = subprocess.Popen(
         [resolve_real_kimi(), *args],
         stdin=subprocess.PIPE,
@@ -455,6 +471,18 @@ def stream_process(args: list[str], prompt: str) -> tuple[int, str, str]:
     def stdout_reader() -> None:
         for chunk in proc.stdout:
             stdout_chunks.append(chunk)
+            if on_text is None:
+                continue
+            for raw_line in chunk.splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except Exception:
+                    continue
+                for text in _extract_stream_texts(event):
+                    on_text(text)
 
     def stderr_reader() -> None:
         for chunk in proc.stderr:
@@ -663,17 +691,26 @@ def run(argv: list[str], prompt: str) -> int:
     write_debug_prompt(rewritten_prompt, prompt_mode)
     print(f"{WRAPPER_PREFIX} mode={prompt_mode} session={session_id}", file=sys.stderr)
 
+    emit_event({"type": "thread.started", "thread_id": session_id})
+
     kimi_args = build_kimi_args(session_id, parsed_args["model"], parsed_args["passthrough"])
-    exit_code, stdout_text, stderr_text = stream_process(kimi_args, rewritten_prompt)
+    exit_code, stdout_text, stderr_text = stream_process(
+        kimi_args,
+        rewritten_prompt,
+        on_text=lambda text: emit_event({"type": "item.completed", "item": {"type": "agent_message", "text": text}}),
+    )
 
     if wrapper_injected_resume and exit_code != 0 and is_unknown_session(stdout_text, stderr_text):
         print(f"{WRAPPER_PREFIX} injected resume session unavailable; retrying fresh", file=sys.stderr)
         clear_state_key(meta.get("agentId", ""), wrapper_key)
         session_id = str(uuid.uuid4())
+        emit_event({"type": "thread.started", "thread_id": session_id})
         kimi_args = build_kimi_args(session_id, parsed_args["model"], parsed_args["passthrough"])
-        exit_code, stdout_text, stderr_text = stream_process(kimi_args, prompt)
-
-    emit_event({"type": "thread.started", "thread_id": session_id})
+        exit_code, stdout_text, stderr_text = stream_process(
+            kimi_args,
+            prompt,
+            on_text=lambda text: emit_event({"type": "item.completed", "item": {"type": "agent_message", "text": text}}),
+        )
 
     if exit_code == 0:
         assistant_text = extract_assistant_text(stdout_text)
