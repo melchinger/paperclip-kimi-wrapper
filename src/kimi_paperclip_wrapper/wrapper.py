@@ -309,6 +309,13 @@ def fetch_issue_context() -> dict:
     }
 
 
+def should_force_fresh_session(meta: dict) -> bool:
+    wake_reason = env_str("PAPERCLIP_WAKE_REASON")
+    task_id = str(meta.get("taskId") or "").strip()
+    # Timer-only wakes without a current task should not accumulate one long-lived thread.
+    return wake_reason == "heartbeat_timer" and not task_id
+
+
 def issue_keys(meta: dict) -> list[str]:
     agent_id = meta.get("agentId", "")
     assignee_id = meta.get("assigneeAgentId", "") or agent_id
@@ -664,12 +671,15 @@ def run(argv: list[str], prompt: str) -> int:
     meta = fetch_issue_context()
     wrapper_key = None
     wrapper_injected_resume = False
+    force_fresh_session = should_force_fresh_session(meta)
 
-    if incoming_resume_session:
+    if incoming_resume_session and not force_fresh_session:
         session_id = incoming_resume_session
         rewritten_prompt, prompt_mode = strip_paperclip_instructions(prompt)
     else:
-        session_id, wrapper_key = resolve_resume_session(meta)
+        session_id = None
+        if not force_fresh_session:
+            session_id, wrapper_key = resolve_resume_session(meta)
         if session_id:
             wrapper_injected_resume = True
             rewritten_prompt, stripped_mode = strip_paperclip_instructions(prompt)
@@ -677,6 +687,8 @@ def run(argv: list[str], prompt: str) -> int:
         else:
             session_id = str(uuid.uuid4())
             prompt_mode = "fresh_session"
+            if force_fresh_session:
+                prompt_mode = "fresh_session:timer_no_task"
 
     task_authority = build_task_authority(meta)
     if task_authority:

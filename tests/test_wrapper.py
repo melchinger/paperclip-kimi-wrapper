@@ -93,6 +93,12 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(session_id, "session-task-1")
         self.assertEqual(key, "task:task-1")
 
+    def test_should_force_fresh_session_for_timer_without_task(self) -> None:
+        with mock.patch.dict(os.environ, {"PAPERCLIP_WAKE_REASON": "heartbeat_timer"}, clear=False):
+            self.assertTrue(wrapper.should_force_fresh_session({}))
+            self.assertTrue(wrapper.should_force_fresh_session({"taskId": ""}))
+            self.assertFalse(wrapper.should_force_fresh_session({"taskId": "task-1"}))
+
     def test_run_emits_events_and_updates_state(self) -> None:
         with mock.patch.object(wrapper, "fetch_issue_context", return_value={"agentId": "agent-1", "taskId": "task-1", "identifier": "MEL-1"}):
             with mock.patch.object(
