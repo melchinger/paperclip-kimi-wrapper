@@ -81,6 +81,32 @@ def resolve_kimi_sessions_dir() -> Path:
     return resolve_runtime_home() / ".kimi" / "sessions"
 
 
+def resolve_skills_dir() -> Path:
+    configured = env_str("PAPERCLIP_KIMI_SKILLS_DIR")
+    if configured:
+        return Path(configured)
+    return resolve_runtime_home() / ".codex" / "skills"
+
+
+def resolve_kimi_mcp_config_file() -> Path:
+    configured = env_str("PAPERCLIP_KIMI_MCP_CONFIG_FILE")
+    if configured:
+        return Path(configured)
+    return resolve_runtime_home() / ".kimi" / "mcp.json"
+
+
+def resolve_disabled_mcp_config_file() -> Path:
+    configured = env_str("PAPERCLIP_KIMI_DISABLED_MCP_CONFIG_FILE")
+    if configured:
+        return Path(configured)
+    return resolve_runtime_home() / ".kimi" / "mcp.disabled.json"
+
+
+def args_contain_option(args: list[str], option: str) -> bool:
+    prefix = f"{option}="
+    return any(arg == option or arg.startswith(prefix) for arg in args)
+
+
 def strip_paperclip_instructions(prompt: str) -> tuple[str, str]:
     marker_index = prompt.find(MARKER)
     if marker_index < 0:
@@ -659,6 +685,16 @@ def build_kimi_args(session_id: str, model: str, extra_args: list[str]) -> list[
     ]
     if model:
         args.extend(["--model", model])
+    skills_dir = resolve_skills_dir()
+    if skills_dir.exists() and not args_contain_option(extra_args, "--skills-dir"):
+        args.extend(["--skills-dir", str(skills_dir)])
+    if not args_contain_option(extra_args, "--mcp-config-file"):
+        if env_flag("PAPERCLIP_KIMI_ENABLE_MCP"):
+            mcp_config_file = resolve_kimi_mcp_config_file()
+        else:
+            mcp_config_file = resolve_disabled_mcp_config_file()
+        if mcp_config_file.exists():
+            args.extend(["--mcp-config-file", str(mcp_config_file)])
     args.extend(extra_args)
     return args
 
