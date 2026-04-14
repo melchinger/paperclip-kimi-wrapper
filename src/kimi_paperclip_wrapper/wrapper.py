@@ -92,14 +92,7 @@ def resolve_kimi_mcp_config_file() -> Path:
     configured = env_str("PAPERCLIP_KIMI_MCP_CONFIG_FILE")
     if configured:
         return Path(configured)
-    return resolve_runtime_home() / ".kimi" / "mcp.json"
-
-
-def resolve_disabled_mcp_config_file() -> Path:
-    configured = env_str("PAPERCLIP_KIMI_DISABLED_MCP_CONFIG_FILE")
-    if configured:
-        return Path(configured)
-    return resolve_runtime_home() / ".kimi" / "mcp.disabled.json"
+    return resolve_runtime_home() / ".kimi" / "mcp.enabled.json"
 
 
 def args_contain_option(args: list[str], option: str) -> bool:
@@ -691,10 +684,8 @@ def build_kimi_args(session_id: str, model: str, extra_args: list[str]) -> list[
     if not args_contain_option(extra_args, "--mcp-config-file"):
         if env_flag("PAPERCLIP_KIMI_ENABLE_MCP"):
             mcp_config_file = resolve_kimi_mcp_config_file()
-        else:
-            mcp_config_file = resolve_disabled_mcp_config_file()
-        if mcp_config_file.exists():
-            args.extend(["--mcp-config-file", str(mcp_config_file)])
+            if mcp_config_file.exists():
+                args.extend(["--mcp-config-file", str(mcp_config_file)])
     args.extend(extra_args)
     return args
 
