@@ -55,7 +55,15 @@ class WrapperTests(unittest.TestCase):
         )
 
     def test_validate_issue_sync_skips_when_disabled(self) -> None:
-        with mock.patch.dict(os.environ, {"PAPERCLIP_VALIDATE_ISSUE_SYNC": "0"}, clear=False):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "PAPERCLIP_VALIDATE_ISSUE_SYNC": "",
+                "PAPERCLIP_VALIDATE_ISSUE_SYNC_MODE": "",
+                "PAPERCLIP_RUN_ID": "",
+            },
+            clear=False,
+        ):
             ok, error = wrapper.validate_issue_sync({"taskId": "issue-1"})
         self.assertTrue(ok)
         self.assertIsNone(error)
@@ -98,6 +106,64 @@ class WrapperTests(unittest.TestCase):
             self.assertTrue(wrapper.should_force_fresh_session({}))
             self.assertTrue(wrapper.should_force_fresh_session({"taskId": ""}))
             self.assertFalse(wrapper.should_force_fresh_session({"taskId": "task-1"}))
+
+    def test_extract_progress_message_maps_status_and_tool_events(self) -> None:
+        status = wrapper._extract_progress_message(
+            {
+                "type": "StatusUpdate",
+                "message": {
+                    "payload": {
+                        "context_tokens": 123,
+                        "token_usage": {"output": 7},
+                    }
+                },
+            }
+        )
+        tool_start = wrapper._extract_progress_message(
+            {
+                "type": "ToolCall",
+                "message": {"payload": {"function": {"name": "Shell"}}},
+            }
+        )
+        tool_done = wrapper._extract_progress_message(
+            {
+                "type": "ToolResult",
+                "message": {
+                    "payload": {
+                        "return_value": {
+                            "is_error": False,
+                            "message": "Command executed successfully.",
+                        }
+                    }
+                },
+            }
+        )
+        self.assertEqual(status, "status update context=123 output=7")
+        self.assertEqual(tool_start, "tool start: Shell")
+        self.assertEqual(tool_done, "tool done: Command executed successfully.")
+
+    def test_build_kimi_args_uses_fallback_workdir_and_add_dir(self) -> None:
+        read_only = Path(self.tempdir.name) / "readonly"
+        fallback = Path(self.tempdir.name) / "fallback"
+        read_only.mkdir()
+        fallback.mkdir()
+        with mock.patch.dict(
+            os.environ,
+            {
+                "PAPERCLIP_KIMI_WORK_DIR": str(fallback),
+                "PAPERCLIP_KIMI_SKILLS_DIR": "",
+            },
+            clear=False,
+        ):
+            with mock.patch.object(wrapper, "is_writable_directory", side_effect=lambda p: Path(p) != read_only):
+                with mock.patch.object(wrapper, "resolve_runtime_home", return_value=Path(self.tempdir.name)):
+                    with mock.patch.object(wrapper.os, "getcwd", return_value=str(read_only)):
+                        work_dir, add_dirs = wrapper.resolve_kimi_work_dir()
+        args = wrapper.build_kimi_args("session-1", "kimi-model", [], work_dir, add_dirs)
+        self.assertIn("--work-dir", args)
+        self.assertIn(str(work_dir), args)
+        self.assertIn("--add-dir", args)
+        self.assertIn(str(read_only), args)
 
     def test_run_emits_events_and_updates_state(self) -> None:
         with mock.patch.object(wrapper, "fetch_issue_context", return_value={"agentId": "agent-1", "taskId": "task-1", "identifier": "MEL-1"}):

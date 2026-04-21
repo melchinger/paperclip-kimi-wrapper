@@ -30,6 +30,27 @@
   - when true, write the final prompt body to `debug-prompts/<run-id>.prompt.txt`
   - accepted truthy values: `1`, `true`, `yes`, `on`
 
+- `PAPERCLIP_KIMI_PROGRESS_LOG_INTERVAL_SECONDS`
+  - rate-limit for wrapper progress lines derived from Kimi `StatusUpdate` events
+  - default: `60`
+
+- `PAPERCLIP_KIMI_INACTIVITY_TIMEOUT_SECONDS`
+  - terminate the Kimi process group after this many seconds without stdout/stderr activity
+  - default: `900`
+
+- `PAPERCLIP_KIMI_KILL_GRACE_SECONDS`
+  - grace period between `SIGTERM` and `SIGKILL` after an inactivity timeout
+  - default: `15`
+
+### Workspace fallback
+
+- `PAPERCLIP_KIMI_WORK_DIR`
+  - fallback root for synthetic writable work directories when the current cwd is not writable
+  - default search order after cwd:
+    - `$PAPERCLIP_KIMI_WORK_DIR`
+    - `$PAPERCLIP_HOME/.kimi/workdirs`
+    - `/tmp/paperclip-kimi-workdirs`
+
 ### Strict issue-sync validation
 
 - `PAPERCLIP_VALIDATE_ISSUE_SYNC`

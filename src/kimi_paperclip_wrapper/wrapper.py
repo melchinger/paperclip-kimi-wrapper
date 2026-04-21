@@ -3,10 +3,12 @@ import json
 import os
 import pwd
 import re
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.request
 import uuid
 from pathlib import Path
@@ -32,20 +34,27 @@ def env_flag(name: str, default: bool = False) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
-def resolve_runtime_home() -> Path:
-    paperclip_home = env_str("PAPERCLIP_HOME")
-    if paperclip_home:
-        return Path(paperclip_home)
-    home = env_str("HOME")
-    if home and home != "/root":
-        return Path(home)
+def env_int(name: str, default: int) -> int:
+    raw = env_str(name)
+    if not raw:
+        return default
     try:
-        passwd_home = pwd.getpwuid(os.getuid()).pw_dir
-        if passwd_home and passwd_home != "/root":
-            return Path(passwd_home)
+        return int(raw)
     except Exception:
-        pass
-    return Path.home()
+        return default
+
+
+def strip_paperclip_instructions(prompt: str) -> tuple[str, str]:
+    marker_index = prompt.find(MARKER)
+    if marker_index < 0:
+        return prompt, "parse_fallback"
+    delimiter_index = prompt.find("\n\n", marker_index)
+    if delimiter_index < 0:
+        return prompt, "parse_fallback"
+    stripped = prompt[delimiter_index + 2 :]
+    if not stripped.strip():
+        return prompt, "parse_fallback"
+    return stripped, "resume_stripped"
 
 
 def resolve_real_kimi() -> str:
@@ -74,49 +83,9 @@ def resolve_paperclip_env_file() -> Path:
     return Path("/etc/paperclip/paperclip.env")
 
 
-def resolve_kimi_sessions_dir() -> Path:
-    configured = env_str("PAPERCLIP_KIMI_SESSIONS_DIR")
-    if configured:
-        return Path(configured)
-    return resolve_runtime_home() / ".kimi" / "sessions"
-
-
-def resolve_skills_dir() -> Path:
-    configured = env_str("PAPERCLIP_KIMI_SKILLS_DIR")
-    if configured:
-        return Path(configured)
-    return resolve_runtime_home() / ".codex" / "skills"
-
-
-def resolve_kimi_mcp_config_file() -> Path:
-    configured = env_str("PAPERCLIP_KIMI_MCP_CONFIG_FILE")
-    if configured:
-        return Path(configured)
-    return resolve_runtime_home() / ".kimi" / "mcp.enabled.json"
-
-
-def args_contain_option(args: list[str], option: str) -> bool:
-    prefix = f"{option}="
-    return any(arg == option or arg.startswith(prefix) for arg in args)
-
-
-def strip_paperclip_instructions(prompt: str) -> tuple[str, str]:
-    marker_index = prompt.find(MARKER)
-    if marker_index < 0:
-        return prompt, "parse_fallback"
-    delimiter_index = prompt.find("\n\n", marker_index)
-    if delimiter_index < 0:
-        return prompt, "parse_fallback"
-    stripped = prompt[delimiter_index + 2 :]
-    if not stripped.strip():
-        return prompt, "parse_fallback"
-    return stripped, "resume_stripped"
-
-
 def load_state() -> dict:
-    path = resolve_state_file()
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(resolve_state_file().read_text(encoding="utf-8"))
     except FileNotFoundError:
         return {"agents": {}}
     except Exception:
@@ -135,7 +104,8 @@ def save_state(data: dict) -> None:
 
 
 def debug_prompt_enabled() -> bool:
-    return env_flag("PAPERCLIP_WRAPPER_DEBUG_PROMPT")
+    value = env_str("PAPERCLIP_WRAPPER_DEBUG_PROMPT").lower()
+    return value in {"1", "true", "yes", "on"}
 
 
 def write_debug_prompt(prompt: str, mode: str) -> None:
@@ -173,9 +143,8 @@ def load_database_url() -> str:
     value = env_str("DATABASE_URL")
     if value:
         return value
-    env_file = resolve_paperclip_env_file()
     try:
-        for raw_line in env_file.read_text(encoding="utf-8").splitlines():
+        for raw_line in resolve_paperclip_env_file().read_text(encoding="utf-8").splitlines():
             line = raw_line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
@@ -186,6 +155,94 @@ def load_database_url() -> str:
     except Exception:
         return ""
     return ""
+
+
+def resolve_runtime_home() -> Path:
+    paperclip_home = env_str("PAPERCLIP_HOME")
+    if paperclip_home:
+        return Path(paperclip_home)
+    home = env_str("HOME")
+    if home and home != "/root":
+        return Path(home)
+    try:
+        passwd_home = pwd.getpwuid(os.getuid()).pw_dir
+        if passwd_home and passwd_home != "/root":
+            return Path(passwd_home)
+    except Exception:
+        pass
+    return Path.home()
+
+
+def resolve_kimi_sessions_dir() -> Path:
+    configured = env_str("PAPERCLIP_KIMI_SESSIONS_DIR")
+    if configured:
+        return Path(configured)
+    return resolve_runtime_home() / ".kimi" / "sessions"
+
+
+def resolve_skills_dir() -> Path:
+    configured = env_str("PAPERCLIP_KIMI_SKILLS_DIR")
+    if configured:
+        return Path(configured)
+    return resolve_runtime_home() / ".codex" / "skills"
+
+
+def resolve_kimi_mcp_config_file() -> Path:
+    configured = env_str("PAPERCLIP_KIMI_MCP_CONFIG_FILE")
+    if configured:
+        return Path(configured)
+    return resolve_runtime_home() / ".kimi" / "mcp.enabled.json"
+
+
+def is_writable_directory(path: Path) -> bool:
+    try:
+        return path.is_dir() and os.access(path, os.W_OK | os.X_OK)
+    except Exception:
+        return False
+
+
+def slugify_path(path: Path) -> str:
+    value = str(path).strip().replace(os.sep, "_")
+    value = re.sub(r"[^A-Za-z0-9._-]+", "_", value)
+    return value.strip("._-") or "workspace"
+
+
+def resolve_kimi_work_dir() -> tuple[Path, list[Path]]:
+    cwd = Path(os.getcwd())
+    add_dirs: list[Path] = []
+    if is_writable_directory(cwd):
+        return cwd, add_dirs
+
+    fallback_root = env_str("PAPERCLIP_KIMI_WORK_DIR")
+    candidate_roots = []
+    if fallback_root:
+        candidate_roots.append(Path(fallback_root))
+    candidate_roots.append(resolve_runtime_home() / ".kimi" / "workdirs")
+    candidate_roots.append(Path("/tmp") / "paperclip-kimi-workdirs")
+
+    for root in candidate_roots:
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            continue
+        if not is_writable_directory(root):
+            continue
+        work_dir = root / slugify_path(cwd)
+        try:
+            work_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            continue
+        if not is_writable_directory(work_dir):
+            continue
+        add_dirs.append(cwd)
+        return work_dir, add_dirs
+
+    return cwd, add_dirs
+
+
+def args_contain_option(args: list[str], option: str) -> bool:
+    prefix = f"{option}="
+    return any(arg == option or arg.startswith(prefix) for arg in args)
 
 
 def sql_quote(value: str) -> str:
@@ -331,7 +388,7 @@ def fetch_issue_context() -> dict:
 def should_force_fresh_session(meta: dict) -> bool:
     wake_reason = env_str("PAPERCLIP_WAKE_REASON")
     task_id = str(meta.get("taskId") or "").strip()
-    # Timer-only wakes without a current task should not accumulate one long-lived thread.
+    # Timer-only dispatcher-style wakes should not accumulate one giant chat thread.
     return wake_reason == "heartbeat_timer" and not task_id
 
 
@@ -379,7 +436,7 @@ def resolve_resume_session(meta: dict) -> tuple[str | None, str | None]:
     for key in issue_keys(meta):
         value = sessions.get(key)
         if isinstance(value, dict):
-            session_id = str(value.get("sessionId") or "").strip()
+            session_id = (value.get("sessionId") or "").strip()
             if session_id:
                 return session_id, key
     ref_session_id, ref_key = resolve_reference_resume(meta, sessions)
@@ -420,7 +477,8 @@ def clear_state_key(agent_id: str, key: str | None) -> None:
 
 
 def is_unknown_session(stdout: str, stderr: str) -> bool:
-    return bool(UNKNOWN_SESSION_RE.search(f"{stdout}\n{stderr}"))
+    haystack = f"{stdout}\n{stderr}"
+    return bool(UNKNOWN_SESSION_RE.search(haystack))
 
 
 def parse_codex_args(argv: list[str]) -> dict:
@@ -478,7 +536,50 @@ def _extract_stream_texts(event: dict) -> list[str]:
     return texts
 
 
+def _extract_progress_message(event: dict) -> str | None:
+    if not isinstance(event, dict):
+        return None
+    event_type = _event_type(event)
+    message = event.get("message")
+    payload = message.get("payload") if isinstance(message, dict) else None
+
+    if event_type == "stepbegin" and isinstance(payload, dict):
+        step = payload.get("n")
+        if step is not None:
+            return f"step {step} started"
+        return "step started"
+
+    if event_type == "statusupdate" and isinstance(payload, dict):
+        token_usage = payload.get("token_usage") or {}
+        output_tokens = token_usage.get("output")
+        context_tokens = payload.get("context_tokens")
+        parts = ["status update"]
+        if context_tokens is not None:
+            parts.append(f"context={context_tokens}")
+        if output_tokens is not None:
+            parts.append(f"output={output_tokens}")
+        return " ".join(parts)
+
+    if event_type == "toolcall" and isinstance(payload, dict):
+        inner = payload.get("function") or {}
+        name = inner.get("name") or payload.get("type") or "tool"
+        return f"tool start: {name}"
+
+    if event_type == "toolresult" and isinstance(payload, dict):
+        result = payload.get("return_value") or {}
+        if result.get("is_error"):
+            detail = result.get("message") or "error"
+            return f"tool error: {detail}"
+        message_text = result.get("message") or "ok"
+        return f"tool done: {message_text}"
+
+    return None
+
+
 def stream_process(args: list[str], prompt: str, on_text=None) -> tuple[int, str, str]:
+    inactivity_timeout = max(env_int("PAPERCLIP_KIMI_INACTIVITY_TIMEOUT_SECONDS", 900), 0)
+    kill_grace = max(env_int("PAPERCLIP_KIMI_KILL_GRACE_SECONDS", 15), 1)
+    progress_interval = max(env_int("PAPERCLIP_KIMI_PROGRESS_LOG_INTERVAL_SECONDS", 60), 0)
     proc = subprocess.Popen(
         [resolve_real_kimi(), *args],
         stdin=subprocess.PIPE,
@@ -486,6 +587,7 @@ def stream_process(args: list[str], prompt: str, on_text=None) -> tuple[int, str
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
+        start_new_session=True,
     )
     assert proc.stdin is not None
     assert proc.stdout is not None
@@ -493,12 +595,23 @@ def stream_process(args: list[str], prompt: str, on_text=None) -> tuple[int, str
 
     stdout_chunks: list[str] = []
     stderr_chunks: list[str] = []
+    activity_lock = threading.Lock()
+    last_activity = time.monotonic()
+    last_progress_log = 0.0
+    timeout_message: list[str] = []
+
+    def mark_activity() -> None:
+        nonlocal last_activity
+        with activity_lock:
+            last_activity = time.monotonic()
 
     def stdout_reader() -> None:
+        nonlocal last_progress_log
         for chunk in proc.stdout:
+            mark_activity()
             stdout_chunks.append(chunk)
             if on_text is None:
-                continue
+                pass
             for raw_line in chunk.splitlines():
                 line = raw_line.strip()
                 if not line:
@@ -507,19 +620,66 @@ def stream_process(args: list[str], prompt: str, on_text=None) -> tuple[int, str
                     event = json.loads(line)
                 except Exception:
                     continue
+                progress = _extract_progress_message(event)
+                if progress:
+                    now = time.monotonic()
+                    event_type = _event_type(event)
+                    should_log = True
+                    if event_type == "statusupdate" and progress_interval > 0:
+                        should_log = (now - last_progress_log) >= progress_interval
+                    if should_log:
+                        last_progress_log = now
+                        progress_line = f"{WRAPPER_PREFIX} {progress}\n"
+                        stderr_chunks.append(progress_line)
+                        sys.stderr.write(progress_line)
+                        sys.stderr.flush()
                 for text in _extract_stream_texts(event):
-                    on_text(text)
+                    if on_text is not None:
+                        on_text(text)
 
     def stderr_reader() -> None:
         for chunk in proc.stderr:
+            mark_activity()
             stderr_chunks.append(chunk)
             sys.stderr.write(chunk)
             sys.stderr.flush()
 
+    def watchdog() -> None:
+        if inactivity_timeout <= 0:
+            return
+        while proc.poll() is None:
+            time.sleep(5)
+            with activity_lock:
+                idle_seconds = time.monotonic() - last_activity
+            if idle_seconds < inactivity_timeout:
+                continue
+            message = (
+                f"{WRAPPER_PREFIX} terminating Kimi after {int(idle_seconds)}s without stdout/stderr activity"
+            )
+            timeout_message.append(message)
+            stderr_chunks.append(message + "\n")
+            sys.stderr.write(message + "\n")
+            sys.stderr.flush()
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                return
+            deadline = time.monotonic() + kill_grace
+            while proc.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.2)
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    return
+            return
+
     stdout_thread = threading.Thread(target=stdout_reader)
     stderr_thread = threading.Thread(target=stderr_reader)
+    watchdog_thread = threading.Thread(target=watchdog, daemon=True)
     stdout_thread.start()
     stderr_thread.start()
+    watchdog_thread.start()
     proc.stdin.write(prompt)
     proc.stdin.close()
     stdout_thread.join()
@@ -566,7 +726,7 @@ def _is_assistant_event(event: dict) -> bool:
     if role == "assistant":
         return True
     event_type = _event_type(event)
-    return event_type in {
+    if event_type in {
         "assistant",
         "assistant_message",
         "response.completed",
@@ -574,7 +734,9 @@ def _is_assistant_event(event: dict) -> bool:
         "message.delta",
         "response.output_text.delta",
         "response.output_text.done",
-    }
+    }:
+        return True
+    return False
 
 
 def extract_assistant_text(stdout: str) -> str:
@@ -587,7 +749,9 @@ def extract_assistant_text(stdout: str) -> str:
             event = json.loads(line)
         except Exception:
             continue
-        if not isinstance(event, dict) or not _is_assistant_event(event):
+        if not isinstance(event, dict):
+            continue
+        if not _is_assistant_event(event):
             continue
         for part in _content_parts(event):
             if part.get("type") != "text":
@@ -607,15 +771,21 @@ def resolve_kimi_session_wire_path(session_id: str) -> Path | None:
         matches = sorted(resolve_kimi_sessions_dir().glob(f"*/{session_id}/wire.jsonl"))
     except Exception:
         return None
-    return matches[-1] if matches else None
+    if matches:
+        return matches[-1]
+    return None
 
 
 def parse_kimi_usage(session_id: str) -> tuple[dict, str | None]:
     wire_path = resolve_kimi_session_wire_path(session_id)
-    zero_usage = {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
     if wire_path is None:
-        return zero_usage, (
-            f"Kimi usage unavailable: no wire.jsonl found for session {session_id} under {resolve_kimi_sessions_dir()}"
+        return (
+            {
+                "input_tokens": 0,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+            },
+            f"Kimi usage unavailable: no wire.jsonl found for session {session_id} under {resolve_kimi_sessions_dir()}",
         )
 
     last_token_usage = None
@@ -640,23 +810,41 @@ def parse_kimi_usage(session_id: str) -> tuple[dict, str | None]:
                 if not isinstance(payload, dict):
                     continue
                 token_usage = payload.get("token_usage")
-                if isinstance(token_usage, dict):
-                    last_token_usage = token_usage
+                if not isinstance(token_usage, dict):
+                    continue
+                last_token_usage = token_usage
     except Exception as exc:
-        return zero_usage, f"Kimi usage unavailable: failed reading {wire_path}: {exc}"
+        return (
+            {
+                "input_tokens": 0,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+            },
+            f"Kimi usage unavailable: failed reading {wire_path}: {exc}",
+        )
 
     if not isinstance(last_token_usage, dict):
-        return zero_usage, f"Kimi usage unavailable: no StatusUpdate token_usage found in {wire_path}"
+        return (
+            {
+                "input_tokens": 0,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+            },
+            f"Kimi usage unavailable: no StatusUpdate token_usage found in {wire_path}",
+        )
 
     input_other = int(last_token_usage.get("input_other") or 0)
     input_cache_read = int(last_token_usage.get("input_cache_read") or 0)
     input_cache_creation = int(last_token_usage.get("input_cache_creation") or 0)
     output = int(last_token_usage.get("output") or 0)
-    return {
-        "input_tokens": input_other + input_cache_read + input_cache_creation,
-        "cached_input_tokens": input_cache_read,
-        "output_tokens": output,
-    }, None
+    return (
+        {
+            "input_tokens": input_other + input_cache_read + input_cache_creation,
+            "cached_input_tokens": input_cache_read,
+            "output_tokens": output,
+        },
+        None,
+    )
 
 
 def emit_event(payload: dict) -> None:
@@ -664,12 +852,14 @@ def emit_event(payload: dict) -> None:
     sys.stdout.flush()
 
 
-def build_kimi_args(session_id: str, model: str, extra_args: list[str]) -> list[str]:
+def build_kimi_args(
+    session_id: str, model: str, extra_args: list[str], work_dir: Path, add_dirs: list[Path]
+) -> list[str]:
     args = [
         "--session",
         session_id,
         "--work-dir",
-        os.getcwd(),
+        str(work_dir),
         "--print",
         "--input-format",
         "text",
@@ -681,6 +871,10 @@ def build_kimi_args(session_id: str, model: str, extra_args: list[str]) -> list[
     skills_dir = resolve_skills_dir()
     if skills_dir.exists() and not args_contain_option(extra_args, "--skills-dir"):
         args.extend(["--skills-dir", str(skills_dir)])
+    for add_dir in add_dirs:
+        if args_contain_option(extra_args, "--add-dir"):
+            break
+        args.extend(["--add-dir", str(add_dir)])
     if not args_contain_option(extra_args, "--mcp-config-file"):
         if env_flag("PAPERCLIP_KIMI_ENABLE_MCP"):
             mcp_config_file = resolve_kimi_mcp_config_file()
@@ -699,6 +893,7 @@ def run(argv: list[str], prompt: str) -> int:
     wrapper_key = None
     wrapper_injected_resume = False
     force_fresh_session = should_force_fresh_session(meta)
+    work_dir, add_dirs = resolve_kimi_work_dir()
 
     if incoming_resume_session and not force_fresh_session:
         session_id = incoming_resume_session
@@ -732,7 +927,13 @@ def run(argv: list[str], prompt: str) -> int:
 
     emit_event({"type": "thread.started", "thread_id": session_id})
 
-    kimi_args = build_kimi_args(session_id, parsed_args["model"], parsed_args["passthrough"])
+    kimi_args = build_kimi_args(
+        session_id,
+        parsed_args["model"],
+        parsed_args["passthrough"],
+        work_dir,
+        add_dirs,
+    )
     exit_code, stdout_text, stderr_text = stream_process(
         kimi_args,
         rewritten_prompt,
@@ -740,11 +941,20 @@ def run(argv: list[str], prompt: str) -> int:
     )
 
     if wrapper_injected_resume and exit_code != 0 and is_unknown_session(stdout_text, stderr_text):
-        print(f"{WRAPPER_PREFIX} injected resume session unavailable; retrying fresh", file=sys.stderr)
+        print(
+            f"{WRAPPER_PREFIX} injected resume session unavailable; retrying fresh",
+            file=sys.stderr,
+        )
         clear_state_key(meta.get("agentId", ""), wrapper_key)
         session_id = str(uuid.uuid4())
         emit_event({"type": "thread.started", "thread_id": session_id})
-        kimi_args = build_kimi_args(session_id, parsed_args["model"], parsed_args["passthrough"])
+        kimi_args = build_kimi_args(
+            session_id,
+            parsed_args["model"],
+            parsed_args["passthrough"],
+            work_dir,
+            add_dirs,
+        )
         exit_code, stdout_text, stderr_text = stream_process(
             kimi_args,
             prompt,
@@ -761,8 +971,18 @@ def run(argv: list[str], prompt: str) -> int:
         if usage_warning:
             print(f"{WRAPPER_PREFIX} {usage_warning}", file=sys.stderr)
         if assistant_text:
-            emit_event({"type": "item.completed", "item": {"type": "agent_message", "text": assistant_text}})
-        emit_event({"type": "turn.completed", "usage": usage})
+            emit_event(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": assistant_text},
+                }
+            )
+        emit_event(
+            {
+                "type": "turn.completed",
+                "usage": usage,
+            }
+        )
         update_state_with_session(meta, session_id)
         return 0
 
@@ -773,3 +993,7 @@ def run(argv: list[str], prompt: str) -> int:
 
 def entrypoint() -> int:
     return run(sys.argv[1:], sys.stdin.read())
+
+
+if __name__ == "__main__":
+    raise SystemExit(entrypoint())
